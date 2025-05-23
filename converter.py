@@ -1,288 +1,233 @@
+#!/usr/bin/env python3
+"""
+RTMP to RTSP Stream Converter - Fixed Version
+Properly handles different streaming methods and protocols.
+"""
+
+import logging
+import json
 import subprocess
 import threading
 import time
-import logging
-import json
+import os
 import signal
 import sys
-import os
-from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
+from dataclasses import dataclass, field
 
-# Настройка логирования
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/converter.log'),
+        logging.FileHandler('rtmp_rtsp_converter.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-class StreamConverter:
-    """Упрощенный RTMP to RTSP конвертер"""
+@dataclass
+class StreamConfig:
+    """Configuration for a single stream conversion"""
+    name: str
+    rtmp_input: str
+    rtsp_output_port: int
+    rtsp_output_path: str = "stream"
+    active: bool = False
+    process: Optional[subprocess.Popen] = field(default=None, repr=False, compare=False)
+
+class RTMPToRTSPConverter:
+    """Main converter class that manages RTMP to RTSP stream conversions"""
     
-    def __init__(self, config_file='streams.json'):
-        self.config_file = config_file
-        self.processes = {}  # Активные процессы FFmpeg
-        self.config = {}     # Конфигурация потоков
+    def __init__(self, base_rtsp_port: int = 8554):
+        self.base_rtsp_port = base_rtsp_port
+        self.streams: Dict[str, StreamConfig] = {}
         self.running = True
-        
-        # Создаем директорию для логов
-        os.makedirs('logs', exist_ok=True)
-        
-        # Загружаем конфигурацию
-        self.load_config()
-        
-        # Обработчик сигналов
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
-    
-    def load_config(self):
-        """Загрузка конфигурации"""
-        try:
-            with open(self.config_file, 'r') as f:
-                self.config = json.load(f)
-            logger.info(f"Загружено {len(self.config.get('streams', {}))} потоков")
-        except FileNotFoundError:
-            logger.warning("Файл конфигурации не найден, создаем пример")
-            self.create_default_config()
-        except Exception as e:
-            logger.error(f"Ошибка загрузки конфигурации: {e}")
-            sys.exit(1)
-    
-    def create_default_config(self):
-        """Создание конфигурации по умолчанию"""
-        default_config = {
-            "streams": {
-                "test": {
-                    "rtmp_url": "rtmp://localhost:1935/live/test",
-                    "rtsp_port": 8554,
-                    "stream_name": "test",
-                    "quality": "medium"
-                }
-            },
-            "settings": {
-                "restart_delay": 10,
-                "max_restart_attempts": 5,
-                "log_level": "INFO"
-            }
-        }
-        
-        with open(self.config_file, 'w') as f:
-            json.dump(default_config, f, indent=2)
-        
-        self.config = default_config
-        logger.info(f"Создана конфигурация по умолчанию: {self.config_file}")
-    
-    def get_ffmpeg_cmd(self, stream_config):
-        """Создание команды FFmpeg"""
-        quality_settings = {
-            "low": ["-s", "640x480", "-b:v", "500k", "-r", "15"],
-            "medium": ["-s", "1280x720", "-b:v", "1500k", "-r", "25"], 
-            "high": ["-s", "1920x1080", "-b:v", "3000k", "-r", "30"]
-        }
-        
-        quality = stream_config.get("quality", "medium")
-        quality_params = quality_settings.get(quality, quality_settings["medium"])
-        
+        self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
+        self.monitor_thread.start()
+
+    def add_stream(self, name: str, rtmp_input: str, rtsp_port: Optional[int] = None) -> bool:
+        """Add a new stream for conversion"""
+        if name in self.streams:
+            logger.error(f"Stream '{name}' already exists.")
+            return False
+
+        if rtsp_port is None:
+            rtsp_port = self.base_rtsp_port + len(self.streams)
+
+        # Validate RTSP port uniqueness
+        for stream in self.streams.values():
+            if stream.rtsp_output_port == rtsp_port:
+                logger.error(f"RTSP port {rtsp_port} is already in use.")
+                return False
+
+        stream_config = StreamConfig(name=name, rtmp_input=rtmp_input, rtsp_output_port=rtsp_port)
+        self.streams[name] = stream_config
+        logger.info(f"Added stream '{name}': {rtmp_input} -> rtsp://localhost:{rtsp_port}/{stream_config.rtsp_output_path}")
+        return True
+
+    def remove_stream(self, name: str) -> bool:
+        """Remove and stop a stream"""
+        if name not in self.streams:
+            logger.error(f"Stream '{name}' not found.")
+            return False
+
+        self.stop_stream(name)
+        del self.streams[name]
+        logger.info(f"Removed stream '{name}'.")
+        return True
+
+    def start_stream(self, name: str) -> bool:
+        """Start converting a specific stream"""
+        if name not in self.streams:
+            logger.error(f"Stream '{name}' not found.")
+            return False
+
+        stream = self.streams[name]
+        if stream.active:
+            logger.warning(f"Stream '{name}' is already active.")
+            return True
+
         cmd = [
-            "ffmpeg",
-            "-i", stream_config["rtmp_url"],
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-c:a", "aac",
-            *quality_params,
-            "-f", "rtsp",
-            f"rtsp://0.0.0.0:{stream_config['rtsp_port']}/{stream_config['stream_name']}"
+            'ffmpeg',
+            '-re',
+            '-i', stream.rtmp_input,
+            '-c', 'copy',
+            '-f', 'rtsp',
+            '-rtsp_transport', 'tcp',
+            '-listen', '1',
+            f'rtsp://0.0.0.0:{stream.rtsp_output_port}/{stream.rtsp_output_path}'
         ]
-        
-        return cmd
-    
-    def start_stream(self, stream_id):
-        """Запуск потока"""
-        if stream_id in self.processes:
-            logger.warning(f"Поток {stream_id} уже запущен")
-            return False
-        
-        stream_config = self.config["streams"].get(stream_id)
-        if not stream_config:
-            logger.error(f"Конфигурация для {stream_id} не найдена")
-            return False
-        
+
         try:
-            cmd = self.get_ffmpeg_cmd(stream_config)
-            logger.info(f"Запуск {stream_id}: {stream_config['rtmp_url']} -> RTSP:{stream_config['rtsp_port']}")
-            
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            self.processes[stream_id] = {
-                'process': process,
-                'config': stream_config,
-                'start_time': datetime.now(),
-                'restart_count': 0
-            }
-            
-            # Мониторинг в отдельном потоке
-            monitor_thread = threading.Thread(
-                target=self.monitor_stream,
-                args=(stream_id,),
-                daemon=True
-            )
-            monitor_thread.start()
-            
-            logger.info(f"Поток {stream_id} запущен (PID: {process.pid})")
+            logger.info(f"Starting stream '{name}' with command: {' '.join(cmd)}")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stream.process = process
+            stream.active = True
+
+            # Log FFmpeg output for debugging
+            threading.Thread(target=self._log_ffmpeg_output, args=(process, name), daemon=True).start()
+
+            logger.info(f"Started stream '{name}'.")
             return True
-            
         except Exception as e:
-            logger.error(f"Ошибка запуска {stream_id}: {e}")
+            logger.error(f"Failed to start stream '{name}': {e}")
             return False
-    
-    def monitor_stream(self, stream_id):
-        """Мониторинг потока"""
-        while self.running and stream_id in self.processes:
-            stream_info = self.processes[stream_id]
-            process = stream_info['process']
-            
-            # Проверяем статус процесса
-            if process.poll() is not None:
-                # Процесс завершился
-                logger.warning(f"Процесс {stream_id} завершился с кодом {process.returncode}")
-                
-                # Попытка перезапуска
-                if stream_info['restart_count'] < self.config['settings']['max_restart_attempts']:
-                    stream_info['restart_count'] += 1
-                    logger.info(f"Перезапуск {stream_id} (попытка {stream_info['restart_count']})")
-                    
-                    # Удаляем старый процесс
-                    del self.processes[stream_id]
-                    
-                    # Ждем и перезапускаем
-                    time.sleep(self.config['settings']['restart_delay'])
-                    self.start_stream(stream_id)
-                else:
-                    logger.error(f"Превышено максимальное количество перезапусков для {stream_id}")
-                    del self.processes[stream_id]
-                break
-            
-            time.sleep(5)  # Проверяем каждые 5 секунд
-    
-    def stop_stream(self, stream_id):
-        """Остановка потока"""
-        if stream_id not in self.processes:
-            logger.warning(f"Поток {stream_id} не запущен")
+
+    def _log_ffmpeg_output(self, process: subprocess.Popen, name: str):
+        """Log FFmpeg process output."""
+        for line in process.stderr:
+            logger.info(f"[FFmpeg - {name}] {line.decode().strip()}")
+
+    def stop_stream(self, name: str) -> bool:
+        """Stop a specific stream"""
+        if name not in self.streams:
+            logger.error(f"Stream '{name}' not found.")
             return False
-        
-        try:
-            process_info = self.processes[stream_id]
-            process = process_info['process']
-            
-            process.terminate()
-            
-            # Ждем завершения
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            
-            del self.processes[stream_id]
-            logger.info(f"Поток {stream_id} остановлен")
+
+        stream = self.streams[name]
+        if not stream.active:
+            logger.warning(f"Stream '{name}' is not active.")
             return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка остановки {stream_id}: {e}")
-            return False
-    
-    def get_status(self):
-        """Получение статуса всех потоков"""
-        status = {
-            "timestamp": datetime.now().isoformat(),
-            "total_streams": len(self.config.get('streams', {})),
-            "active_streams": len(self.processes),
-            "streams": {}
-        }
-        
-        for stream_id, stream_config in self.config.get('streams', {}).items():
-            is_active = stream_id in self.processes
-            stream_status = {
-                "active": is_active,
-                "rtmp_url": stream_config["rtmp_url"],
-                "rtsp_url": f"rtsp://localhost:{stream_config['rtsp_port']}/{stream_config['stream_name']}",
-                "quality": stream_config["quality"]
-            }
-            
-            if is_active:
-                process_info = self.processes[stream_id]
-                stream_status.update({
-                    "pid": process_info['process'].pid,
-                    "start_time": process_info['start_time'].isoformat(),
-                    "restart_count": process_info['restart_count']
-                })
-            
-            status["streams"][stream_id] = stream_status
-        
-        return status
-    
-    def start_all(self):
-        """Запуск всех потоков"""
-        logger.info("Запуск всех потоков...")
-        for stream_id in self.config.get('streams', {}):
-            self.start_stream(stream_id)
-            time.sleep(2)  # Задержка между запусками
-    
-    def stop_all(self):
-        """Остановка всех потоков"""
-        logger.info("Остановка всех потоков...")
-        for stream_id in list(self.processes.keys()):
-            self.stop_stream(stream_id)
-    
-    def shutdown(self, signum=None, frame=None):
-        """Корректное завершение"""
-        logger.info("Завершение работы конвертера...")
+
+        if stream.process:
+            stream.process.terminate()
+            stream.process.wait()
+            stream.process = None
+
+        stream.active = False
+        logger.info(f"Stopped stream '{name}'.")
+        return True
+
+    def monitor_streams(self):
+        """Monitor stream health and restart failed streams"""
+        while self.running:
+            for name, stream in list(self.streams.items()):
+                if stream.active and (stream.process is None or stream.process.poll() is not None):
+                    logger.warning(f"Stream '{name}' has stopped unexpectedly. Restarting...")
+                    self.start_stream(name)
+            time.sleep(5)
+
+    def start_monitoring(self):
+        """Start the monitoring thread explicitly."""
+        if not self.monitor_thread.is_alive():
+            self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
+            self.monitor_thread.start()
+            logger.info("Stream monitoring started.")
+
+    def shutdown(self):
+        """Graceful shutdown"""
         self.running = False
-        self.stop_all()
-        sys.exit(0)
-    
-    def run(self):
-        """Главный цикл"""
-        logger.info("=== RTMP to RTSP Converter запущен ===")
-        
-        # Показываем информацию о конфигурации
-        status = self.get_status()
-        print(f"\nНастроено потоков: {status['total_streams']}")
-        
-        for stream_id, stream_info in status['streams'].items():
-            print(f"  {stream_id}: {stream_info['rtmp_url']} -> {stream_info['rtsp_url']}")
-        
-        print("\nДля просмотра RTSP потока:")
-        print("  vlc rtsp://localhost:PORT/STREAM_NAME")
-        print("  ffplay rtsp://localhost:PORT/STREAM_NAME")
-        print("\nДля остановки нажмите Ctrl+C\n")
-        
-        # Запускаем все потоки
-        self.start_all()
-        
-        # Главный цикл мониторинга
-        try:
-            while self.running:
-                time.sleep(30)
-                
-                # Показываем статус каждые 30 секунд
-                status = self.get_status()
-                logger.info(f"Активных потоков: {status['active_streams']}/{status['total_streams']}")
-                
-        except KeyboardInterrupt:
-            logger.info("Получен сигнал остановки")
-        finally:
-            self.shutdown()
+        for name in list(self.streams.keys()):
+            self.stop_stream(name)
+        logger.info("Shutdown complete.")
+
+    def get_all_status(self) -> Dict[str, Dict]:
+        """Get the status of all streams."""
+        return {
+            name: {
+                "rtmp_input": stream.rtmp_input,
+                "rtsp_url": f"rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}",
+                "active": stream.active
+            }
+            for name, stream in self.streams.items()
+        }
+
+def load_config(config_file: str) -> List[Dict]:
+    """Load stream configurations from JSON file"""
+    try:
+        with open(config_file, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Configuration file '{config_file}' not found.")
+        return []
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from '{config_file}': {e}")
+        return []
+
+def create_sample_config(config_file: str):
+    """Create a sample configuration file"""
+    sample_config = [
+        {
+            "name": "test_stream",
+            "rtmp_input": "rtmp://localhost/live/test",
+            "rtsp_port": 8554
+        }
+    ]
+    with open(config_file, 'w') as f:
+        json.dump(sample_config, f, indent=4)
+    logger.info(f"Sample configuration created: {config_file}")
+
+def signal_handler(signum, frame, converter):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}, shutting down...")
+    converter.shutdown()
+    sys.exit(0)
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="RTMP to RTSP Stream Converter")
+    parser.add_argument("--config", default="streams.json", help="Configuration file (default: streams.json)")
+    parser.add_argument("--create-config", action="store_true", help="Create sample configuration file")
+    args = parser.parse_args()
+
+    if args.create_config:
+        create_sample_config(args.config)
+        return
+
+    converter = RTMPToRTSPConverter()
+    signal.signal(signal.SIGINT, lambda s, f: signal_handler(s, f, converter))
+
+    config = load_config(args.config)
+    for stream in config:
+        converter.add_stream(stream['name'], stream['rtmp_input'], stream.get('rtsp_port'))
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        converter.shutdown()
 
 if __name__ == "__main__":
-    converter = StreamConverter()
-    converter.run()
+    main()
