@@ -43,8 +43,20 @@ class RTMPToRTSPConverter:
         self.base_rtsp_port = base_rtsp_port
         self.streams: Dict[str, StreamConfig] = {}
         self.running = True
-        self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
-        self.monitor_thread.start()
+        self.used_ports = set()
+        # Don't start monitoring thread in __init__ to avoid double-starting
+        self.monitor_thread = None
+
+    def _get_available_port(self, preferred_port: Optional[int] = None) -> int:
+        """Get an available port for RTSP output"""
+        if preferred_port and preferred_port not in self.used_ports:
+            return preferred_port
+        
+        # Find next available port starting from base_rtsp_port
+        port = self.base_rtsp_port
+        while port in self.used_ports:
+            port += 1
+        return port
 
     def add_stream(self, name: str, rtmp_input: str, rtsp_port: Optional[int] = None) -> bool:
         """Add a new stream for conversion"""
@@ -52,17 +64,17 @@ class RTMPToRTSPConverter:
             logger.error(f"Stream '{name}' already exists.")
             return False
 
-        if rtsp_port is None:
-            rtsp_port = self.base_rtsp_port + len(self.streams)
-
-        # Validate RTSP port uniqueness
-        for stream in self.streams.values():
-            if stream.rtsp_output_port == rtsp_port:
-                logger.error(f"RTSP port {rtsp_port} is already in use.")
-                return False
+        # Get available port
+        rtsp_port = self._get_available_port(rtsp_port)
+        
+        # Check if port is already in use by existing streams
+        if rtsp_port in self.used_ports:
+            logger.error(f"RTSP port {rtsp_port} is already in use.")
+            return False
 
         stream_config = StreamConfig(name=name, rtmp_input=rtmp_input, rtsp_output_port=rtsp_port)
         self.streams[name] = stream_config
+        self.used_ports.add(rtsp_port)
         logger.info(f"Added stream '{name}': {rtmp_input} -> rtsp://localhost:{rtsp_port}/{stream_config.rtsp_output_path}")
         return True
 
@@ -72,7 +84,9 @@ class RTMPToRTSPConverter:
             logger.error(f"Stream '{name}' not found.")
             return False
 
+        stream = self.streams[name]
         self.stop_stream(name)
+        self.used_ports.discard(stream.rtsp_output_port)
         del self.streams[name]
         logger.info(f"Removed stream '{name}'.")
         return True
@@ -88,27 +102,34 @@ class RTMPToRTSPConverter:
             logger.warning(f"Stream '{name}' is already active.")
             return True
 
+        # Alternative approach: Use MediaMTX-compatible output
+        # Instead of creating RTSP server, push to MediaMTX
         cmd = [
             'ffmpeg',
             '-re',
             '-i', stream.rtmp_input,
-            '-c', 'copy',
+            '-c:v', 'copy',
+            '-c:a', 'copy',
             '-f', 'rtsp',
             '-rtsp_transport', 'tcp',
-            '-listen', '1',
-            f'rtsp://0.0.0.0:{stream.rtsp_output_port}/{stream.rtsp_output_path}'
+            f'rtsp://localhost:8554/{name}'  # Push to MediaMTX
         ]
 
         try:
             logger.info(f"Starting stream '{name}' with command: {' '.join(cmd)}")
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid if hasattr(os, 'setsid') else None
+            )
             stream.process = process
             stream.active = True
 
             # Log FFmpeg output for debugging
             threading.Thread(target=self._log_ffmpeg_output, args=(process, name), daemon=True).start()
 
-            logger.info(f"Started stream '{name}'.")
+            logger.info(f"Started stream '{name}'. Access via: rtsp://localhost:8554/{name}")
             return True
         except Exception as e:
             logger.error(f"Failed to start stream '{name}': {e}")
@@ -116,8 +137,12 @@ class RTMPToRTSPConverter:
 
     def _log_ffmpeg_output(self, process: subprocess.Popen, name: str):
         """Log FFmpeg process output."""
-        for line in process.stderr:
-            logger.info(f"[FFmpeg - {name}] {line.decode().strip()}")
+        try:
+            for line in iter(process.stderr.readline, b''):
+                if line:
+                    logger.info(f"[FFmpeg - {name}] {line.decode().strip()}")
+        except Exception as e:
+            logger.error(f"Error reading FFmpeg output for {name}: {e}")
 
     def stop_stream(self, name: str) -> bool:
         """Stop a specific stream"""
@@ -131,8 +156,17 @@ class RTMPToRTSPConverter:
             return True
 
         if stream.process:
-            stream.process.terminate()
-            stream.process.wait()
+            try:
+                # Try graceful termination first
+                stream.process.terminate()
+                stream.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if graceful termination fails
+                stream.process.kill()
+                stream.process.wait()
+            except Exception as e:
+                logger.error(f"Error stopping stream '{name}': {e}")
+            
             stream.process = None
 
         stream.active = False
@@ -142,15 +176,20 @@ class RTMPToRTSPConverter:
     def monitor_streams(self):
         """Monitor stream health and restart failed streams"""
         while self.running:
-            for name, stream in list(self.streams.items()):
-                if stream.active and (stream.process is None or stream.process.poll() is not None):
-                    logger.warning(f"Stream '{name}' has stopped unexpectedly. Restarting...")
-                    self.start_stream(name)
-            time.sleep(5)
+            try:
+                for name, stream in list(self.streams.items()):
+                    if stream.active and (stream.process is None or stream.process.poll() is not None):
+                        logger.warning(f"Stream '{name}' has stopped unexpectedly. Restarting...")
+                        stream.active = False  # Reset state
+                        self.start_stream(name)
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"Error in stream monitoring: {e}")
+                time.sleep(5)
 
     def start_monitoring(self):
         """Start the monitoring thread explicitly."""
-        if not self.monitor_thread.is_alive():
+        if self.monitor_thread is None or not self.monitor_thread.is_alive():
             self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
             self.monitor_thread.start()
             logger.info("Stream monitoring started.")
@@ -167,10 +206,20 @@ class RTMPToRTSPConverter:
         return {
             name: {
                 "rtmp_input": stream.rtmp_input,
-                "rtsp_url": f"rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}",
+                "rtsp_url": f"rtsp://localhost:8554/{name}",  # MediaMTX URL
                 "active": stream.active
             }
             for name, stream in self.streams.items()
+        }
+    
+    def get_stream_status(self, name) -> Dict:
+        stream = self.streams.get(name)
+        if not stream:
+            return None
+        return {
+            "rtmp_input": stream.rtmp_input,
+            "rtsp_url": f"rtsp://localhost:8554/{name}",  # MediaMTX URL
+            "active": stream.active
         }
 
 def load_config(config_file: str) -> List[Dict]:
@@ -191,7 +240,7 @@ def create_sample_config(config_file: str):
         {
             "name": "test_stream",
             "rtmp_input": "rtmp://localhost/live/test",
-            "rtsp_port": 8554
+            "rtsp_port": 8555
         }
     ]
     with open(config_file, 'w') as f:

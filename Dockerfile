@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 # Install FFmpeg and required system packages
@@ -8,12 +9,14 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy application files
-COPY converter.py .
+# Copy requirements first for better caching
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all application files
+COPY . .
 
 # Create logs directory
 RUN mkdir -p logs
@@ -21,8 +24,8 @@ RUN mkdir -p logs
 # Create a default configuration if none exists
 RUN echo '[]' > streams.json
 
-# Expose RTSP ports (8554-8560 range)
-EXPOSE 8554-8560
+# Expose Flask port and RTSP ports
+EXPOSE 5000 8554-8560
 
-# Run the application
-CMD ["python", "rtmp_rtsp_converter.py", "--config", "streams.json"]
+# Run the Flask application
+CMD ["python", "app.py"]

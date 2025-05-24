@@ -6,6 +6,7 @@ services:
     container_name: rtmp-rtsp-converter
     ports:
       # RTSP output ports - adjust as needed
+      - "5000:5000"
       - "8554:8554"
       - "8555:8555"
       - "8556:8556"

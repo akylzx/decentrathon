@@ -1,25 +1,7 @@
-{
-  "streams": [
-    {
-      "name": "test_stream",
-      "rtmp_input": "rtmp://localhost/live/test",
-      "rtsp_port": 8844,
-      "method": "ffmpeg_rtsp"
-    }
-  ],
-  "global_settings": {
-    "base_rtsp_port": 8554,
-    "log_level": "INFO",
-    "restart_attempts": 3,
-    "monitor_interval": 10,
-    "ffmpeg_options": {
-      "codec": "copy",
-      "format": "rtsp",
-      "transport": "tcp",
-      "genpts": true,
-      "rtsp_flags": [
-        "listen"
-      ]
-    }
+[
+  {
+    "name": "test_stream",
+    "rtmp_input": "rtmp://localhost:1935/live/test",
+    "rtsp_port": 8555
   }
-}
+]
