@@ -1,31 +1,34 @@
-
-FROM python:3.11-slim
-
-# Install FFmpeg and required system packages
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    unzip \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all application files
+# Download and install MediaMTX
+# RUN curl -L -o mediamtx.zip https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_amd64.zip && \
+#     unzip mediamtx.zip -d /usr/local/bin/ && \
+#     rm mediamtx.zip
+
+# Copy application files
 COPY . .
 
-# Create logs directory
-RUN mkdir -p logs
+# Expose necessary ports
+EXPOSE 5000 8554
 
-# Create a default configuration if none exists
-RUN echo '[]' > streams.json
+# Add healthcheck for Flask server
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD curl -f http://localhost:5000/ || exit 1
 
-# Expose Flask port and RTSP ports
-EXPOSE 5000 8554-8560
-
-# Run the Flask application
-CMD ["python", "app.py"]
+# Start MediaMTX and Flask server
+# CMD /usr/local/bin/mediamtx --config ./config/mediamtx.yml & python app.py

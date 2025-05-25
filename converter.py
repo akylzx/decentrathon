@@ -7,9 +7,8 @@ import re
 from typing import Dict, Optional, List, Union
 from dataclasses import dataclass, field
 
-# Configure logging
 logging.basicConfig(
-    level=logging.INFO, # Changed back to INFO for cleaner console output by default
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('rtmp_rtsp_converter.log'),
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StreamConfig:
-    """Configuration and state for a single stream conversion"""
+    """Configuration and state for a single stream conversion."""
     name: str
     rtmp_input: Union[str, List[str]]
     rtsp_output_port: int
@@ -28,7 +27,7 @@ class StreamConfig:
     active: bool = False
     process: Optional[subprocess.Popen] = field(default=None, repr=False, compare=False)
     current_input_index: int = 0
-    metrics: Dict[str, Union[str, int, float]] = field(default_factory=dict) # Keep metrics for other info
+    metrics: Dict[str, Union[str, int, float]] = field(default_factory=dict)
 
 class RTMPToRTSPConverter:
     """Manages RTMP to RTSP stream conversions."""
@@ -39,9 +38,7 @@ class RTMPToRTSPConverter:
         self.monitor_thread = None
 
     def add_stream(self, name: str, rtmp_input: str, rtsp_port: int, rtsp_output_path: str) -> bool:
-        """Add a new stream for conversion.
-        'name' serves as the unique identifier and the RTSP path.
-        """
+        """Add a new stream for conversion."""
         if name in self.streams:
             logger.error(f"Stream '{name}' already exists.")
             return False
@@ -88,7 +85,7 @@ class RTMPToRTSPConverter:
             '-c:a', 'copy',
             '-f', 'rtsp',
             '-rtsp_transport', 'tcp',
-            '-progress', 'pipe:2',  # Still need progress for other metrics
+            '-progress', 'pipe:2',
             f'rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}'
         ]
 
@@ -112,13 +109,9 @@ class RTMPToRTSPConverter:
             return False
 
     def _parse_metrics_from_line(self, line: str, stream: StreamConfig):
-        """Parse metrics from FFmpeg output line.
-        Optimized to exclude bitrate parsing.
-        """
-        # Define patterns for extracting key-value pairs
+        """Parse metrics from FFmpeg output line."""
         key_value_pattern = re.compile(r'^\s*([a-zA-Z_0-9\.]+?)(?:=(\s*\S.*))?$')
         
-        # Try to parse as a single key-value pair first
         kv_match = key_value_pattern.match(line)
         if kv_match:
             key = kv_match.group(1).strip()
@@ -126,7 +119,6 @@ class RTMPToRTSPConverter:
             if value_str:
                 value_str = value_str.strip()
 
-            # Handle specific key conversions
             if key == 'frame':
                 stream.metrics[key] = int(value_str) if value_str and value_str.isdigit() else 0
             elif key == 'fps':
@@ -134,12 +126,12 @@ class RTMPToRTSPConverter:
                     stream.metrics[key] = float(value_str) if value_str else 0.0
                 except ValueError:
                     stream.metrics[key] = 0.0
-            elif key.startswith('stream_') and key.endswith('_q'): # For stream_0_0_q
+            elif key.startswith('stream_') and key.endswith('_q'):
                 try:
                     stream.metrics['q'] = float(value_str) if value_str else -1.0
                 except ValueError:
                     stream.metrics['q'] = -1.0
-            elif key == 'size' or key == 'total_size': # FFmpeg might use 'total_size' for size
+            elif key == 'size' or key == 'total_size':
                 if value_str == 'N/A':
                     stream.metrics['size'] = 'N/A'
                 else:
@@ -164,9 +156,7 @@ class RTMPToRTSPConverter:
                 stream.metrics['drop'] = int(value_str) if value_str and value_str.isdigit() else 0
             elif key == 'dup_frames':
                 stream.metrics['dup'] = int(value_str) if value_str and value_str.isdigit() else 0
-            # Removed bitrate parsing
             
-            # General connection status updates from single lines (less critical for metrics)
             if "Connection to" in line and "failed" in line:
                 stream.metrics['connection_status'] = 'failed'
             elif "Stream mapping:" in line:
@@ -174,10 +164,8 @@ class RTMPToRTSPConverter:
             elif "Opening" in line and "for writing" in line:
                 stream.metrics['connection_status'] = 'connecting'
             
-            return # Metric processed, exit.
+            return
 
-        # If it's not a single key=value line, try to parse it as a multi-metric progress line
-        
         multi_metric_patterns = {
             'frame': r'frame=\s*(\d+)',
             'fps': r'fps=\s*([\d.]+)',
@@ -189,8 +177,6 @@ class RTMPToRTSPConverter:
             'dup': r'dup=(\s*\d+)'
         }
         
-        multi_metric_data_found = False
-
         for key, pattern in multi_metric_patterns.items():
             match = re.search(pattern, line)
             if match:
@@ -209,10 +195,10 @@ class RTMPToRTSPConverter:
                         except ValueError:
                             stream.metrics[key] = 'N/A'
                 elif key == 'drop' or key == 'dup':
-                     try:
-                         stream.metrics[key] = int(value)
-                     except ValueError:
-                         stream.metrics[key] = 0
+                    try:
+                        stream.metrics[key] = int(value)
+                    except ValueError:
+                        stream.metrics[key] = 0
                 else:
                     try:
                         if key in ['frame', 'drop', 'dup']:
@@ -223,11 +209,7 @@ class RTMPToRTSPConverter:
                             stream.metrics[key] = value
                     except ValueError:
                         stream.metrics[key] = value
-                multi_metric_data_found = True
 
-        # Removed bitrate parsing from multi-metric section as well
-
-        # Connection status updates for lines that are not typical metrics
         if "Connection to" in line and "failed" in line:
             stream.metrics['connection_status'] = 'failed'
         elif "Stream mapping:" in line:
@@ -311,14 +293,14 @@ class RTMPToRTSPConverter:
                 time.sleep(5)
 
     def start_monitoring(self):
-        """Start the monitoring thread explicitly."""
+        """Start the monitoring thread."""
         if self.monitor_thread is None or not self.monitor_thread.is_alive():
             self.monitor_thread = threading.Thread(target=self.monitor_streams, daemon=True)
             self.monitor_thread.start()
             logger.info("Stream monitoring started.")
 
     def shutdown(self):
-        """Graceful shutdown: stops all active streams and the monitoring thread."""
+        """Gracefully shut down all active streams and the monitoring thread."""
         self.running = False
         for name in list(self.streams.keys()):
             self.stop_stream(name)
