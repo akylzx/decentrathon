@@ -1,23 +1,15 @@
-#!/usr/bin/env python3
-"""
-RTMP to RTSP Stream Converter - Fixed Version
-Properly handles different streaming methods and protocols.
-"""
-
 import logging
-import json
 import subprocess
 import threading
 import time
 import os
-import signal
-import sys
-from typing import Dict, Optional, List
+import re
+from typing import Dict, Optional, List, Union
 from dataclasses import dataclass, field
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # Changed back to INFO for cleaner console output by default
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('rtmp_rtsp_converter.log'),
@@ -28,91 +20,76 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StreamConfig:
-    """Configuration for a single stream conversion"""
+    """Configuration and state for a single stream conversion"""
     name: str
-    rtmp_input: str
+    rtmp_input: Union[str, List[str]]
     rtsp_output_port: int
-    rtsp_output_path: str = "stream"
+    rtsp_output_path: str
     active: bool = False
     process: Optional[subprocess.Popen] = field(default=None, repr=False, compare=False)
+    current_input_index: int = 0
+    metrics: Dict[str, Union[str, int, float]] = field(default_factory=dict) # Keep metrics for other info
 
 class RTMPToRTSPConverter:
-    """Main converter class that manages RTMP to RTSP stream conversions"""
+    """Manages RTMP to RTSP stream conversions."""
     
-    def __init__(self, base_rtsp_port: int = 8554):
-        self.base_rtsp_port = base_rtsp_port
+    def __init__(self):
         self.streams: Dict[str, StreamConfig] = {}
         self.running = True
-        self.used_ports = set()
-        # Don't start monitoring thread in __init__ to avoid double-starting
         self.monitor_thread = None
 
-    def _get_available_port(self, preferred_port: Optional[int] = None) -> int:
-        """Get an available port for RTSP output"""
-        if preferred_port and preferred_port not in self.used_ports:
-            return preferred_port
-        
-        # Find next available port starting from base_rtsp_port
-        port = self.base_rtsp_port
-        while port in self.used_ports:
-            port += 1
-        return port
-
-    def add_stream(self, name: str, rtmp_input: str, rtsp_port: Optional[int] = None) -> bool:
-        """Add a new stream for conversion"""
+    def add_stream(self, name: str, rtmp_input: str, rtsp_port: int, rtsp_output_path: str) -> bool:
+        """Add a new stream for conversion.
+        'name' serves as the unique identifier and the RTSP path.
+        """
         if name in self.streams:
             logger.error(f"Stream '{name}' already exists.")
             return False
-
-        # Get available port
-        rtsp_port = self._get_available_port(rtsp_port)
         
-        # Check if port is already in use by existing streams
-        if rtsp_port in self.used_ports:
-            logger.error(f"RTSP port {rtsp_port} is already in use.")
-            return False
-
-        stream_config = StreamConfig(name=name, rtmp_input=rtmp_input, rtsp_output_port=rtsp_port)
+        stream_config = StreamConfig(
+            name=name,
+            rtmp_input=rtmp_input,
+            rtsp_output_port=rtsp_port,
+            rtsp_output_path=rtsp_output_path
+        )
         self.streams[name] = stream_config
-        self.used_ports.add(rtsp_port)
-        logger.info(f"Added stream '{name}': {rtmp_input} -> rtsp://localhost:{rtsp_port}/{stream_config.rtsp_output_path}")
+        logger.info(f"Added stream '{name}': {rtmp_input} -> rtsp://localhost:{rtsp_port}/{rtsp_output_path}")
         return True
 
     def remove_stream(self, name: str) -> bool:
-        """Remove and stop a stream"""
+        """Remove and stop a stream."""
         if name not in self.streams:
             logger.error(f"Stream '{name}' not found.")
             return False
 
-        stream = self.streams[name]
         self.stop_stream(name)
-        self.used_ports.discard(stream.rtsp_output_port)
         del self.streams[name]
         logger.info(f"Removed stream '{name}'.")
         return True
 
     def start_stream(self, name: str) -> bool:
-        """Start converting a specific stream"""
-        if name not in self.streams:
+        """Start converting a specific stream."""
+        stream = self.streams.get(name)
+        if not stream:
             logger.error(f"Stream '{name}' not found.")
             return False
 
-        stream = self.streams[name]
         if stream.active:
             logger.warning(f"Stream '{name}' is already active.")
             return True
+        
+        current_input = stream.rtmp_input
 
-        # Alternative approach: Use MediaMTX-compatible output
-        # Instead of creating RTSP server, push to MediaMTX
         cmd = [
             'ffmpeg',
             '-re',
-            '-i', stream.rtmp_input,
+            '-i', current_input,
             '-c:v', 'copy',
             '-c:a', 'copy',
             '-f', 'rtsp',
             '-rtsp_transport', 'tcp',
-            f'rtsp://localhost:8554/{name}'  # Push to MediaMTX
+            '-progress', 'pipe:2',  # Still need progress for other metrics
+            f'rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}'
         ]
 
         try:
@@ -126,61 +103,207 @@ class RTMPToRTSPConverter:
             stream.process = process
             stream.active = True
 
-            # Log FFmpeg output for debugging
             threading.Thread(target=self._log_ffmpeg_output, args=(process, name), daemon=True).start()
 
-            logger.info(f"Started stream '{name}'. Access via: rtsp://localhost:8554/{name}")
+            logger.info(f"Stream '{name}' started. Access via: rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}")
             return True
         except Exception as e:
             logger.error(f"Failed to start stream '{name}': {e}")
             return False
 
+    def _parse_metrics_from_line(self, line: str, stream: StreamConfig):
+        """Parse metrics from FFmpeg output line.
+        Optimized to exclude bitrate parsing.
+        """
+        # Define patterns for extracting key-value pairs
+        key_value_pattern = re.compile(r'^\s*([a-zA-Z_0-9\.]+?)(?:=(\s*\S.*))?$')
+        
+        # Try to parse as a single key-value pair first
+        kv_match = key_value_pattern.match(line)
+        if kv_match:
+            key = kv_match.group(1).strip()
+            value_str = kv_match.group(2)
+            if value_str:
+                value_str = value_str.strip()
+
+            # Handle specific key conversions
+            if key == 'frame':
+                stream.metrics[key] = int(value_str) if value_str and value_str.isdigit() else 0
+            elif key == 'fps':
+                try:
+                    stream.metrics[key] = float(value_str) if value_str else 0.0
+                except ValueError:
+                    stream.metrics[key] = 0.0
+            elif key.startswith('stream_') and key.endswith('_q'): # For stream_0_0_q
+                try:
+                    stream.metrics['q'] = float(value_str) if value_str else -1.0
+                except ValueError:
+                    stream.metrics['q'] = -1.0
+            elif key == 'size' or key == 'total_size': # FFmpeg might use 'total_size' for size
+                if value_str == 'N/A':
+                    stream.metrics['size'] = 'N/A'
+                else:
+                    if 'KiB' in value_str:
+                        num_val = float(value_str.replace('KiB', '').strip())
+                        stream.metrics['size'] = int(round(num_val * 1024 / 1000))
+                    elif 'kB' in value_str:
+                        stream.metrics['size'] = int(value_str.replace('kB', '').strip())
+                    else:
+                        try:
+                            stream.metrics['size'] = int(value_str)
+                        except ValueError:
+                            stream.metrics['size'] = 'N/A'
+            elif key == 'time' or key == 'out_time':
+                stream.metrics['time'] = value_str.split('.')[0] if value_str else "00:00:00"
+            elif key == 'speed':
+                try:
+                    stream.metrics[key] = float(value_str.replace('x', '').strip()) if value_str else 0.0
+                except ValueError:
+                    stream.metrics[key] = 0.0
+            elif key == 'drop_frames':
+                stream.metrics['drop'] = int(value_str) if value_str and value_str.isdigit() else 0
+            elif key == 'dup_frames':
+                stream.metrics['dup'] = int(value_str) if value_str and value_str.isdigit() else 0
+            # Removed bitrate parsing
+            
+            # General connection status updates from single lines (less critical for metrics)
+            if "Connection to" in line and "failed" in line:
+                stream.metrics['connection_status'] = 'failed'
+            elif "Stream mapping:" in line:
+                stream.metrics['connection_status'] = 'connected'
+            elif "Opening" in line and "for writing" in line:
+                stream.metrics['connection_status'] = 'connecting'
+            
+            return # Metric processed, exit.
+
+        # If it's not a single key=value line, try to parse it as a multi-metric progress line
+        
+        multi_metric_patterns = {
+            'frame': r'frame=\s*(\d+)',
+            'fps': r'fps=\s*([\d.]+)',
+            'q': r'q=\s*([-\d.]+)',
+            'size': r'size=\s*(\s*\d+(?:KiB|kB)|N/A)',
+            'time': r'time=(\d{2}:\d{2}:\d{2}\.\d{2})',
+            'speed': r'speed=\s*([\d.]+)x',
+            'drop': r'drop=(\s*\d+)',
+            'dup': r'dup=(\s*\d+)'
+        }
+        
+        multi_metric_data_found = False
+
+        for key, pattern in multi_metric_patterns.items():
+            match = re.search(pattern, line)
+            if match:
+                value = match.group(1).strip()
+                if key == 'size' and value == 'N/A':
+                    stream.metrics['size'] = 'N/A'
+                elif key == 'size':
+                    if 'KiB' in value:
+                        num_val = float(value.replace('KiB', '').strip())
+                        stream.metrics[key] = int(round(num_val * 1024 / 1000))
+                    elif 'kB' in value:
+                        stream.metrics[key] = int(value.replace('kB', '').strip())
+                    else:
+                        try:
+                            stream.metrics[key] = int(value.strip())
+                        except ValueError:
+                            stream.metrics[key] = 'N/A'
+                elif key == 'drop' or key == 'dup':
+                     try:
+                         stream.metrics[key] = int(value)
+                     except ValueError:
+                         stream.metrics[key] = 0
+                else:
+                    try:
+                        if key in ['frame', 'drop', 'dup']:
+                            stream.metrics[key] = int(value)
+                        elif key in ['fps', 'speed', 'q']:
+                            stream.metrics[key] = float(value)
+                        else:
+                            stream.metrics[key] = value
+                    except ValueError:
+                        stream.metrics[key] = value
+                multi_metric_data_found = True
+
+        # Removed bitrate parsing from multi-metric section as well
+
+        # Connection status updates for lines that are not typical metrics
+        if "Connection to" in line and "failed" in line:
+            stream.metrics['connection_status'] = 'failed'
+        elif "Stream mapping:" in line:
+            stream.metrics['connection_status'] = 'connected'
+        elif "Opening" in line and "for writing" in line:
+            stream.metrics['connection_status'] = 'connecting'
+
+
     def _log_ffmpeg_output(self, process: subprocess.Popen, name: str):
-        """Log FFmpeg process output."""
+        """Log FFmpeg process output and parse metrics."""
+        stream = self.streams.get(name)
+        if not stream:
+            return
+        
         try:
-            for line in iter(process.stderr.readline, b''):
-                if line:
-                    logger.info(f"[FFmpeg - {name}] {line.decode().strip()}")
+            for line_bytes in iter(process.stderr.readline, b''):
+                if not line_bytes:
+                    break
+                    
+                line = line_bytes.decode('utf-8', errors='ignore').strip()
+                
+                if not line:
+                    continue
+
+                logger.debug(f"[FFmpeg - {name}] {line}")
+
+                self._parse_metrics_from_line(line, stream)
+
+                if any(keyword in line.lower() for keyword in ['error', 'failed', 'warning']):
+                    logger.warning(f"[FFmpeg - {name}] {line}")
+                elif 'frame=' in line and 'fps=' in line and 'time=' in line:
+                    logger.info(f"[FFmpeg - {name}] Progress: {line}")
+
         except Exception as e:
             logger.error(f"Error reading FFmpeg output for {name}: {e}")
+        finally:
+            if stream and stream.active:
+                stream.active = False
+                stream.metrics.clear()
+                logger.warning(f"FFmpeg process for stream '{name}' has ended.")
 
     def stop_stream(self, name: str) -> bool:
-        """Stop a specific stream"""
-        if name not in self.streams:
+        """Stop a specific stream."""
+        stream = self.streams.get(name)
+        if not stream:
             logger.error(f"Stream '{name}' not found.")
             return False
 
-        stream = self.streams[name]
         if not stream.active:
             logger.warning(f"Stream '{name}' is not active.")
             return True
 
         if stream.process:
             try:
-                # Try graceful termination first
                 stream.process.terminate()
                 stream.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                # Force kill if graceful termination fails
                 stream.process.kill()
                 stream.process.wait()
             except Exception as e:
                 logger.error(f"Error stopping stream '{name}': {e}")
-            
             stream.process = None
 
         stream.active = False
+        stream.metrics.clear()
         logger.info(f"Stopped stream '{name}'.")
         return True
 
     def monitor_streams(self):
-        """Monitor stream health and restart failed streams"""
+        """Monitor stream health and restart failed streams."""
         while self.running:
             try:
                 for name, stream in list(self.streams.items()):
                     if stream.active and (stream.process is None or stream.process.poll() is not None):
                         logger.warning(f"Stream '{name}' has stopped unexpectedly. Restarting...")
-                        stream.active = False  # Reset state
+                        stream.active = False
                         self.start_stream(name)
                 time.sleep(5)
             except Exception as e:
@@ -195,10 +318,15 @@ class RTMPToRTSPConverter:
             logger.info("Stream monitoring started.")
 
     def shutdown(self):
-        """Graceful shutdown"""
+        """Graceful shutdown: stops all active streams and the monitoring thread."""
         self.running = False
         for name in list(self.streams.keys()):
             self.stop_stream(name)
+        
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=10)
+            if self.monitor_thread.is_alive():
+                logger.warning("Monitor thread did not shut down gracefully.")
         logger.info("Shutdown complete.")
 
     def get_all_status(self) -> Dict[str, Dict]:
@@ -206,77 +334,21 @@ class RTMPToRTSPConverter:
         return {
             name: {
                 "rtmp_input": stream.rtmp_input,
-                "rtsp_url": f"rtsp://localhost:8554/{name}",  # MediaMTX URL
-                "active": stream.active
+                "rtsp_url": f"rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}",
+                "active": stream.active,
+                "metrics": stream.metrics.copy() if stream.metrics else {}
             }
             for name, stream in self.streams.items()
         }
     
-    def get_stream_status(self, name) -> Dict:
+    def get_stream_status(self, name) -> Optional[Dict]:
+        """Get the status of a specific stream."""
         stream = self.streams.get(name)
         if not stream:
             return None
         return {
             "rtmp_input": stream.rtmp_input,
-            "rtsp_url": f"rtsp://localhost:8554/{name}",  # MediaMTX URL
-            "active": stream.active
+            "rtsp_url": f"rtsp://localhost:{stream.rtsp_output_port}/{stream.rtsp_output_path}",
+            "active": stream.active,
+            "metrics": stream.metrics.copy() if stream.metrics else {}
         }
-
-def load_config(config_file: str) -> List[Dict]:
-    """Load stream configurations from JSON file"""
-    try:
-        with open(config_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error(f"Configuration file '{config_file}' not found.")
-        return []
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON from '{config_file}': {e}")
-        return []
-
-def create_sample_config(config_file: str):
-    """Create a sample configuration file"""
-    sample_config = [
-        {
-            "name": "test_stream",
-            "rtmp_input": "rtmp://localhost/live/test",
-            "rtsp_port": 8555
-        }
-    ]
-    with open(config_file, 'w') as f:
-        json.dump(sample_config, f, indent=4)
-    logger.info(f"Sample configuration created: {config_file}")
-
-def signal_handler(signum, frame, converter):
-    """Handle shutdown signals"""
-    logger.info(f"Received signal {signum}, shutting down...")
-    converter.shutdown()
-    sys.exit(0)
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="RTMP to RTSP Stream Converter")
-    parser.add_argument("--config", default="streams.json", help="Configuration file (default: streams.json)")
-    parser.add_argument("--create-config", action="store_true", help="Create sample configuration file")
-    args = parser.parse_args()
-
-    if args.create_config:
-        create_sample_config(args.config)
-        return
-
-    converter = RTMPToRTSPConverter()
-    signal.signal(signal.SIGINT, lambda s, f: signal_handler(s, f, converter))
-
-    config = load_config(args.config)
-    for stream in config:
-        converter.add_stream(stream['name'], stream['rtmp_input'], stream.get('rtsp_port'))
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        converter.shutdown()
-
-if __name__ == "__main__":
-    main()

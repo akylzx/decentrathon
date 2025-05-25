@@ -33,9 +33,16 @@ def list_streams():
 def add_stream():
     """Add a new stream"""
     data = request.json
-    name = data.get('name')
+    name = data.get('name') # This will be the unique path
     rtmp_input = data.get('rtmp_input')
-    rtsp_port = int(data.get('rtsp_port', 8554))
+    
+    # We will now allow multiple streams on the same port, but they must have unique 'name' (path)
+    try:
+        rtsp_port = int(data.get('rtsp_port', 8554))
+        if rtsp_port < 1024 or rtsp_port > 65535:
+            return jsonify({"error": "RTSP port must be between 1024 and 65535"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid RTSP port"}), 400
 
     if not name or not rtmp_input:
         return jsonify({"error": "Missing name or RTMP URL"}), 400
@@ -43,27 +50,27 @@ def add_stream():
     if not is_valid_rtmp_url(rtmp_input):
         return jsonify({"error": "Invalid RTMP URL"}), 400
 
-    # Check if the RTSP port is already in use
-    for stream in converter.streams.values():
-        if stream.rtsp_output_port == rtsp_port:
-            return jsonify({"error": "RTSP port is already in use"}), 400
+    # The 'name' must be unique as it serves as the RTSP path
+    if name in converter.streams:
+        return jsonify({"error": f"Stream with name '{name}' already exists. Please choose a unique name."}), 400
 
-    # Add and start the stream
-    if converter.add_stream(name, rtmp_input, rtsp_port):
+    logger.info(f"Adding stream '{name}' with RTSP port {rtsp_port}")
+    # Pass the 'name' as the rtsp_output_path
+    if converter.add_stream(name, rtmp_input, rtsp_port, name):
         if converter.start_stream(name):
             return jsonify({
                 "status": "success",
-                "message": "Stream added and started",
+                "message": f"Stream added and started on port {rtsp_port} with path /{name}",
                 "stream": converter.get_stream_status(name)
             })
-        converter.remove_stream(name)
+        converter.remove_stream(name) # Clean up if start fails
         return jsonify({"error": "Failed to start stream"}), 500
 
     return jsonify({"error": "Failed to add stream"}), 400
 
 @app.route('/api/streams/<name>/toggle', methods=['POST'])
 def toggle_stream(name):
-    """Toggle stream state"""
+    """Toggle stream state (start/stop)"""
     stream = converter.get_stream_status(name)
     if not stream:
         return jsonify({"error": "Stream not found"}), 404
@@ -79,8 +86,8 @@ def toggle_stream(name):
 def delete_stream(name):
     """Delete a stream"""
     if converter.remove_stream(name):
-        return jsonify({"status": "success"})
-    return jsonify({"error": "Failed to delete stream"}), 404
+        return jsonify({"status": "success", "message": f"Stream '{name}' deleted."})
+    return jsonify({"error": "Failed to delete stream or stream not found"}), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True)

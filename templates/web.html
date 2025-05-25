@@ -11,7 +11,7 @@
       }
 
       body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        font-family: -apple-system, BlinkMacMacSystemFont, "Segoe UI", Roboto,
           sans-serif;
         background: #f8f9fa;
         color: #1a1a1a;
@@ -345,6 +345,49 @@
         color: #9a3412;
       }
 
+      .stream-details.metrics {
+        display: flex;
+        gap: 15px;
+        margin-top: 8px;
+        font-size: 0.9rem;
+        color: #444;
+      }
+
+      .stream-label {
+        font-weight: 600;
+        margin-right: 4px;
+      }
+
+      .stream-health-icons {
+        display: flex;
+        gap: 10px;
+        font-size: 1.2rem;
+        align-items: center;
+        margin-left: auto;
+      }
+
+      .health-badge.enabled {
+        color: green;
+      }
+
+      .health-badge.disabled {
+        color: gray;
+      }
+
+      .stream-card {
+        border: 1px solid #ddd;
+        padding: 12px 15px;
+        border-radius: 6px;
+        margin-bottom: 10px;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .stream-header {
+        display: flex;
+        align-items: center;
+      }
+
       @media (max-width: 768px) {
         .container {
           padding: 16px;
@@ -660,62 +703,91 @@
 
         if (streamEntries.length === 0) {
           streamList.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-state-icon">📡</div>
-                        <p>No streams configured yet</p>
-                    </div>
-                `;
+      <div class="empty-state">
+          <div class="empty-state-icon">📡</div>
+          <p>No streams configured yet</p>
+      </div>
+    `;
           return;
         }
 
         streamList.innerHTML = streamEntries
           .map(
             ([name, info]) => `
-                    <div class="stream-card fade-in">
-                        <div class="stream-header">
-                            <div>
-                                <div class="stream-title">${escapeHtml(
-                                  name
-                                )}</div>
-                                <span class="stream-status status-${
-                                  info.active ? "active" : "inactive"
-                                }">
-                                    ${info.active ? "Running" : "Stopped"}
-                                </span>
-                            </div>
-                        </div>
-                        <div class="stream-details">
-                            <div class="stream-detail">
-                                <span class="stream-label">RTMP:</span>
-                                <span class="stream-value">${escapeHtml(
-                                  info.rtmp_input
-                                )}</span>
-                            </div>
-                            <div class="stream-detail">
-                                <span class="stream-label">RTSP:</span>
-                                <span class="stream-value">${escapeHtml(
-                                  info.rtsp_url
-                                )}</span>
-                            </div>
-                        </div>
-                        <div class="stream-actions">
-                            <button onclick="toggleStream('${escapeHtml(
-                              name
-                            )}')" class="btn btn-sm ${
-              info.active ? "btn-secondary" : "btn-primary"
-            }">
-                                ${info.active ? "Stop" : "Start"}
-                            </button>
-                            <button onclick="deleteStream('${escapeHtml(
-                              name
-                            )}')" class="btn btn-sm btn-danger">
-                                Delete
-                            </button>
-                        </div>
-                    </div>
-                `
+      <div class="stream-card fade-in" data-stream-name="${escapeHtml(name)}">
+          <div class="stream-header">
+              <div>
+                  <div class="stream-title">${escapeHtml(name)}</div>
+                  <span class="stream-status status-${
+                    info.active ? "active" : "inactive"
+                  }">
+                      ${info.active ? "Running" : "Stopped"}
+                  </span>
+              </div>
+              <div class="stream-health-icons">
+                <span title="Auto Restart" class="health-badge ${
+                  info.metrics?.auto_restart ? "enabled" : "disabled"
+                }">
+                </span>
+                <span title="Backup Failover" class="health-badge ${
+                  info.metrics?.backup_failover ? "enabled" : "disabled"
+                }">
+                </span>
+              </div>
+          </div>
+          <div class="stream-details">
+              <div class="stream-detail">
+                  <span class="stream-label">RTMP:</span>
+                  <span class="stream-value">${escapeHtml(
+                    info.rtmp_input
+                  )}</span>
+              </div>
+              <div class="stream-detail">
+                  <span class="stream-label">RTSP:</span>
+                  <span class="stream-value">${escapeHtml(info.rtsp_url)}</span>
+              </div>
+              <div class="stream-detail metrics">
+                  <span class="stream-label">FPS:</span>
+                  <span class="stream-value">${
+                    info.metrics?.fps ?? "-"
+                  } fps</span>
+                  <span class="stream-label">Frame Drops:</span>
+                  <span class="stream-value">${
+                    info.metrics?.frame ?? "-"
+                  }</span>
+                  <span class="stream-label">Speed:</span>
+                  <span class="stream-value">${
+                    info.metrics?.speed ?? "-"
+                  }</span>
+                  <span class="stream-label">Time:</span>
+                  <span class="stream-value">${info.metrics?.time ?? "-"}</span>
+          </div>
+          </div>
+          <div class="stream-actions">
+              <button class="toggle-btn btn btn-sm ${
+                info.active ? "btn-secondary" : "btn-primary"
+              }">${info.active ? "Stop" : "Start"}</button>
+              <button class="delete-btn btn btn-sm btn-danger">Delete</button>
+          </div>
+      </div>
+    `
           )
           .join("");
+
+        // Attach event listeners safely after rendering
+        streamList.querySelectorAll(".toggle-btn").forEach((button) => {
+          button.addEventListener("click", (e) => {
+            const name = e.target.closest(".stream-card").dataset.streamName;
+            toggleStream(name);
+          });
+        });
+
+        streamList.querySelectorAll(".delete-btn").forEach((button) => {
+          button.addEventListener("click", (e) => {
+            const name = e.target.closest(".stream-card").dataset.streamName;
+            deleteStream(name);
+          });
+        });
       }
 
       function updateStats() {
